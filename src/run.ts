@@ -303,9 +303,39 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
-    if (this.returnContent) {
-      return this.Graph.getContentParts();
+    /**
+     * Break the reference chain that keeps heavy data alive via
+     * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
+     * `@langchain/core` `RunTree.extra[lc:child_config]` →
+     * Node.js `AsyncLocalStorage` context captured by timers/promises.
+     *
+     * Without this, base64-encoded images/PDFs in message content remain
+     * reachable from lingering `Timeout` handles until GC runs.
+     */
+    if ((config.configurable as Record<string, unknown> | undefined) != null) {
+      for (const key of Object.getOwnPropertySymbols(config.configurable)) {
+        const val = config.configurable[key as unknown as string] as
+          | Record<string, unknown>
+          | undefined;
+        if (
+          val != null &&
+          typeof val === 'object' &&
+          'currentTaskInput' in val
+        ) {
+          (val as Record<string, unknown>).currentTaskInput = undefined;
+        }
+        delete config.configurable[key as unknown as string];
+      }
+      config.configurable = undefined;
     }
+    config.callbacks = undefined;
+
+    const result = this.returnContent
+      ? this.Graph.getContentParts()
+      : undefined;
+
+    this.Graph.clearHeavyState();
+    return result;
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

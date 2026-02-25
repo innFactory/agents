@@ -139,6 +139,26 @@ export abstract class Graph<
    * Currently supports code execution session tracking (session_id, files).
    */
   sessions: t.ToolSessionMap = new Map();
+
+  /**
+   * Clears heavy references to allow GC to reclaim memory held by
+   * LangGraph's internal config / AsyncLocalStorage RunTree chain.
+   * Call after a run completes and content has been extracted.
+   */
+  clearHeavyState(): void {
+    this.config = undefined;
+    this.signal = undefined;
+    this.contentData = [];
+    this.contentIndexMap = new Map();
+    this.stepKeyIds = new Map();
+    this.toolCallStepIds.clear();
+    this.messageIdsByStepKey = new Map();
+    this.messageStepHasToolCalls = new Map();
+    this.prelimMessageIdsByStepKey = new Map();
+    this.invokedToolIds = undefined;
+    this.handlerRegistry = undefined;
+    this.sessions.clear();
+  }
 }
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
@@ -213,6 +233,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    for (const context of this.agentContexts.values()) {
+      context.reset();
+    }
+  }
+
+  override clearHeavyState(): void {
+    super.clearHeavyState();
+    this.messages = [];
+    this.overrideModel = undefined;
     for (const context of this.agentContexts.values()) {
       context.reset();
     }
