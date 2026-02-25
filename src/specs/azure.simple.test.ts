@@ -149,6 +149,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -234,6 +235,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -306,6 +308,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -423,6 +426,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Respond with exactly one sentence.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 

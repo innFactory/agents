@@ -45,6 +45,7 @@ export class Run<_T extends t.BaseGraphState> {
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
+  private skipCleanup: boolean = false;
 
   private constructor(config: Partial<t.RunConfig>) {
     const runId = config.runId ?? '';
@@ -89,6 +90,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     this.returnContent = config.returnContent ?? false;
+    this.skipCleanup = config.skipCleanup ?? false;
   }
 
   private createLegacyGraph(
@@ -312,29 +314,35 @@ export class Run<_T extends t.BaseGraphState> {
      * Without this, base64-encoded images/PDFs in message content remain
      * reachable from lingering `Timeout` handles until GC runs.
      */
-    if ((config.configurable as Record<string, unknown> | undefined) != null) {
-      for (const key of Object.getOwnPropertySymbols(config.configurable)) {
-        const val = config.configurable[key as unknown as string] as
-          | Record<string, unknown>
-          | undefined;
-        if (
-          val != null &&
-          typeof val === 'object' &&
-          'currentTaskInput' in val
-        ) {
-          (val as Record<string, unknown>).currentTaskInput = undefined;
+    if (!this.skipCleanup) {
+      if (
+        (config.configurable as Record<string, unknown> | undefined) != null
+      ) {
+        for (const key of Object.getOwnPropertySymbols(config.configurable)) {
+          const val = config.configurable[key as unknown as string] as
+            | Record<string, unknown>
+            | undefined;
+          if (
+            val != null &&
+            typeof val === 'object' &&
+            'currentTaskInput' in val
+          ) {
+            (val as Record<string, unknown>).currentTaskInput = undefined;
+          }
+          delete config.configurable[key as unknown as string];
         }
-        delete config.configurable[key as unknown as string];
+        config.configurable = undefined;
       }
-      config.configurable = undefined;
+      config.callbacks = undefined;
     }
-    config.callbacks = undefined;
 
     const result = this.returnContent
       ? this.Graph.getContentParts()
       : undefined;
 
-    this.Graph.clearHeavyState();
+    if (!this.skipCleanup) {
+      this.Graph.clearHeavyState();
+    }
     return result;
   }
 
