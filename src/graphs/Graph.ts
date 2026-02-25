@@ -1068,26 +1068,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             metadata
           );
-        }
-        const stepId = this.getStepIdByKey(stepKey);
-        const content = responseMessage.content;
-        if (typeof content === 'string') {
-          await this.dispatchMessageDelta(stepId, {
-            content: [{ type: ContentTypes.TEXT, text: content }],
-          });
-        } else if (
-          Array.isArray(content) &&
-          content.every(
-            (c) =>
-              typeof c === 'object' &&
-              'type' in c &&
-              typeof c.type === 'string' &&
-              c.type.startsWith('text')
-          )
-        ) {
-          await this.dispatchMessageDelta(stepId, {
-            content: content as t.MessageDelta['content'],
-          });
+          const stepId = this.getStepIdByKey(stepKey);
+          const content = responseMessage.content;
+          if (typeof content === 'string') {
+            await this.dispatchMessageDelta(stepId, {
+              content: [{ type: ContentTypes.TEXT, text: content }],
+            });
+          } else if (
+            Array.isArray(content) &&
+            content.every(
+              (c) =>
+                typeof c === 'object' &&
+                'type' in c &&
+                typeof c.type === 'string' &&
+                c.type.startsWith('text')
+            )
+          ) {
+            await this.dispatchMessageDelta(stepId, {
+              content: content as t.MessageDelta['content'],
+            });
+          }
         }
       }
 
