@@ -6,9 +6,47 @@ import type {
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
 } from '@langchain/google-common';
-import type { BaseMessage } from '@langchain/core/messages';
-import { isAIMessage } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
+
+/**
+ * `@langchain/google-common`'s `_streamResponseChunks` emits usage on TWO
+ * different paths within the same stream:
+ *
+ *   - Streaming chunks set `chunk.generationInfo.usage_metadata` via
+ *     `responseToUsageMetadata`, which correctly sums
+ *     `candidatesTokenCount + thoughtsTokenCount` and includes
+ *     `output_token_details.reasoning`.
+ *   - The trailing fallback chunk (emitted after the API stream exhausts)
+ *     attaches its own `chunk.message.usage_metadata` built inline as
+ *     `output_tokens = candidatesTokenCount` only — dropping
+ *     `thoughtsTokenCount` and `output_token_details` entirely.
+ *
+ * After `AIMessageChunk.concat`, only `message.usage_metadata` survives —
+ * which is the buggy fallback value. This breaks the documented
+ * `total_tokens === input_tokens + output_tokens` invariant and silently
+ * undercharges thinking models for reasoning tokens.
+ *
+ * The repair: track the last `generationInfo.usage_metadata` we see, and
+ * when the fallback chunk arrives with its buggy `message.usage_metadata`,
+ * replace it with the tracked good value. `CustomChatGoogleGenerativeAI`
+ * solves the same problem for the Google API path differently — by
+ * overriding `_convertToUsageMetadata`.
+ */
+export function repairStreamUsageMetadata(
+  current: UsageMetadata | undefined,
+  generationInfoUsage: UsageMetadata | undefined
+): UsageMetadata | undefined {
+  if (!current) return current;
+  if (!generationInfoUsage) return current;
+  if (generationInfoUsage.total_tokens !== current.total_tokens) return current;
+  if (generationInfoUsage.output_tokens <= current.output_tokens)
+    return current;
+  return generationInfoUsage;
+}
 
 type AdditionalKwargs =
   | undefined
@@ -445,6 +483,35 @@ export class ChatVertexAI extends ChatGoogle {
       params.maxReasoningTokens = -1;
     }
     return params;
+  }
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    let lastGoodUsage: UsageMetadata | undefined;
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      const genUsage = (
+        chunk.generationInfo as { usage_metadata?: UsageMetadata } | undefined
+      )?.usage_metadata;
+      if (genUsage) {
+        lastGoodUsage = genUsage;
+      }
+      if (chunk.message instanceof AIMessageChunk) {
+        const repaired = repairStreamUsageMetadata(
+          chunk.message.usage_metadata,
+          lastGoodUsage
+        );
+        if (repaired !== chunk.message.usage_metadata) {
+          chunk.message.usage_metadata = repaired;
+        }
+      }
+      yield chunk;
+    }
   }
   buildConnection(
     fields: VertexAIClientOptions | undefined,
