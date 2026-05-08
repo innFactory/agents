@@ -313,6 +313,15 @@ function toInjectedFileRef(
   return { ...base, kind: 'user' };
 }
 
+/* Stable file identity = `(storage_session_id, id)`. Same name in
+ * different storage sessions are distinct files. */
+function fileIdentityKey(file: {
+  storage_session_id?: string;
+  id: string;
+}): string {
+  return `${file.storage_session_id ?? ''}\0${file.id}`;
+}
+
 function updateCodeSession(
   sessions: t.ToolSessionMap,
   execSessionId: string,
@@ -324,27 +333,50 @@ function updateCodeSession(
     | undefined;
   const existingFiles = existingSession?.files ?? [];
 
-  if (newFiles.length > 0) {
-    const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-      ...file,
-      storage_session_id: file.storage_session_id ?? execSessionId,
-    }));
-    const newFileNames = new Set(filesWithSession.map((f) => f.name));
-    const filteredExisting = existingFiles.filter(
-      (f) => !newFileNames.has(f.name)
-    );
-    sessions.set(Constants.EXECUTE_CODE, {
-      session_id: execSessionId,
-      files: [...filteredExisting, ...filesWithSession],
-      lastUpdated: Date.now(),
-    });
-  } else {
+  if (newFiles.length === 0) {
     sessions.set(Constants.EXECUTE_CODE, {
       session_id: execSessionId,
       files: existingFiles,
       lastUpdated: Date.now(),
     });
+    return;
   }
+
+  /* Worker echoes lack ownership identity (kind/resource_id/version) —
+   * sandbox doesn't re-attest; that's signed at upload. Merge by
+   * (storage_session_id, id) so prior identity survives the echo. */
+  const filesWithSession: t.FileRefs = [];
+  const newFileNames = new Set<string>();
+  const incomingByIdentity = new Map<string, number>();
+  for (const file of newFiles) {
+    const withSession = {
+      ...file,
+      storage_session_id: file.storage_session_id ?? execSessionId,
+    };
+    incomingByIdentity.set(
+      fileIdentityKey(withSession),
+      filesWithSession.length
+    );
+    newFileNames.add(withSession.name);
+    filesWithSession.push(withSession);
+  }
+
+  const filteredExisting: t.FileRefs = [];
+  for (const e of existingFiles) {
+    const idx = incomingByIdentity.get(fileIdentityKey(e));
+    if (idx !== undefined) {
+      filesWithSession[idx] = { ...e, ...filesWithSession[idx] };
+    }
+    if (!newFileNames.has(e.name)) {
+      filteredExisting.push(e);
+    }
+  }
+
+  sessions.set(Constants.EXECUTE_CODE, {
+    session_id: execSessionId,
+    files: [...filteredExisting, ...filesWithSession],
+    lastUpdated: Date.now(),
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
