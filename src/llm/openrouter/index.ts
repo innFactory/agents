@@ -29,6 +29,7 @@ export interface ChatOpenRouterCallOptions
   include_reasoning?: boolean;
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
+  promptCache?: boolean;
 }
 
 export type ChatOpenRouterInput = Partial<
@@ -104,31 +105,45 @@ export class ChatOpenRouter extends ChatOpenAI {
   private includeReasoning?: boolean;
 
   constructor(_fields: ChatOpenRouterInput) {
+    const fieldsWithoutPromptCache: ChatOpenRouterInput = { ..._fields };
+    delete fieldsWithoutPromptCache.promptCache;
+
     const {
       include_reasoning,
       reasoning: openRouterReasoning,
       modelKwargs = {},
       ...fields
-    } = _fields;
+    } = fieldsWithoutPromptCache;
 
     // Extract reasoning from modelKwargs if provided there (e.g., from LLMConfig)
     const { reasoning: mkReasoning, ...restModelKwargs } = modelKwargs as {
       reasoning?: OpenRouterReasoning;
     } & Record<string, unknown>;
+    const mergedReasoning =
+      mkReasoning != null || openRouterReasoning != null
+        ? {
+          ...mkReasoning,
+          ...openRouterReasoning,
+        }
+        : undefined;
+    const runtimeReasoning =
+      mergedReasoning ??
+      (include_reasoning === true ? { enabled: true } : undefined);
+    const parentModelKwargs =
+      runtimeReasoning == null
+        ? restModelKwargs
+        : { ...restModelKwargs, reasoning: runtimeReasoning };
 
     super({
       ...fields,
-      modelKwargs: restModelKwargs,
+      modelKwargs: parentModelKwargs,
       includeReasoningDetails: true,
       convertReasoningDetailsToContent: true,
     });
 
     // Merge reasoning config: modelKwargs.reasoning < constructor reasoning
-    if (mkReasoning != null || openRouterReasoning != null) {
-      this.openRouterReasoning = {
-        ...mkReasoning,
-        ...openRouterReasoning,
-      };
+    if (mergedReasoning != null) {
+      this.openRouterReasoning = mergedReasoning;
     }
 
     this.includeReasoning = include_reasoning;

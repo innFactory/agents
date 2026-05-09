@@ -11,6 +11,17 @@ type DeepSeekRequest =
 type OpenAIChatCompletion = OpenAIClient.Chat.Completions.ChatCompletion;
 type OpenAIChatCompletionChunk =
   OpenAIClient.Chat.Completions.ChatCompletionChunk;
+type PromptTokensDetailsWithCacheWrite = NonNullable<
+  OpenAIClient.Completions.CompletionUsage['prompt_tokens_details']
+> & {
+  cache_write_tokens?: number;
+};
+type CompletionUsageWithCacheWrite = Omit<
+  OpenAIClient.Completions.CompletionUsage,
+  'prompt_tokens_details'
+> & {
+  prompt_tokens_details?: PromptTokensDetailsWithCacheWrite;
+};
 type ReasoningAssistantMessageParam =
   OpenAIClient.Chat.Completions.ChatCompletionAssistantMessageParam & {
     reasoning_content?: string;
@@ -129,7 +140,7 @@ async function* createCompletionStream(
 }
 
 function createCompletion(
-  usage: OpenAIClient.Completions.CompletionUsage = {
+  usage: CompletionUsageWithCacheWrite = {
     prompt_tokens: 1,
     completion_tokens: 1,
     total_tokens: 2,
@@ -392,6 +403,7 @@ describe('ChatDeepSeek', () => {
         prompt_tokens_details: {
           audio_tokens: 2,
           cached_tokens: 3,
+          cache_write_tokens: 6,
         },
         completion_tokens_details: {
           audio_tokens: 4,
@@ -409,6 +421,7 @@ describe('ChatDeepSeek', () => {
       input_token_details: {
         audio: 2,
         cache_read: 3,
+        cache_creation: 6,
       },
       output_token_details: {
         audio: 4,

@@ -120,6 +120,17 @@ type OpenRouterReasoningStreamChoice = Omit<
 > & {
   delta: OpenRouterReasoningStreamDelta;
 };
+type PromptTokensDetailsWithCacheWrite = NonNullable<
+  OpenAIClient.Completions.CompletionUsage['prompt_tokens_details']
+> & {
+  cache_write_tokens?: number;
+};
+type CompletionUsageWithCacheWrite = Omit<
+  OpenAIClient.Completions.CompletionUsage,
+  'prompt_tokens_details'
+> & {
+  prompt_tokens_details?: PromptTokensDetailsWithCacheWrite;
+};
 type OpenAIStreamModel = ChatOpenAI | AzureChatOpenAI;
 
 const baseAzureFields = {
@@ -652,6 +663,71 @@ describe('custom chat model class smoke tests', () => {
         index: 1,
       },
     ]);
+  });
+
+  it('maps OpenRouter cache write usage to cache_creation in streaming responses', async () => {
+    const model = new ChatOpenRouter({
+      model: 'anthropic/claude-sonnet-test',
+      apiKey: 'test-key',
+      streamUsage: true,
+    });
+    const completions = (model as unknown as StreamingCompletionBackedModel)
+      .completions;
+    const usage: CompletionUsageWithCacheWrite = {
+      prompt_tokens: 11,
+      completion_tokens: 7,
+      total_tokens: 18,
+      prompt_tokens_details: {
+        audio_tokens: 2,
+        cached_tokens: 3,
+        cache_write_tokens: 5,
+      },
+      completion_tokens_details: {
+        audio_tokens: 4,
+        reasoning_tokens: 6,
+      },
+    };
+
+    async function* streamChunks(): AsyncGenerator<OpenAIClient.Chat.Completions.ChatCompletionChunk> {
+      yield createOpenAIStreamChunk('answer', 'stop');
+      yield {
+        id: 'chatcmpl-openrouter-usage',
+        object: 'chat.completion.chunk',
+        created: 0,
+        model: 'anthropic/claude-sonnet-test',
+        choices: [],
+        usage,
+      } as OpenAIClient.Chat.Completions.ChatCompletionChunk;
+    }
+
+    completions.completionWithRetry = async (): Promise<
+      AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+    > => streamChunks();
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([new HumanMessage('hi')]);
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    const usageChunk = chunks.find(
+      (chunk) =>
+        chunk.usage_metadata?.input_token_details?.cache_creation === 5
+    );
+    expect(usageChunk?.usage_metadata).toEqual({
+      input_tokens: 11,
+      output_tokens: 7,
+      total_tokens: 18,
+      input_token_details: {
+        audio: 2,
+        cache_read: 3,
+        cache_creation: 5,
+      },
+      output_token_details: {
+        audio: 4,
+        reasoning: 6,
+      },
+    });
   });
 
   it('keeps Anthropic output, residency, compaction, and stream-delay options', () => {

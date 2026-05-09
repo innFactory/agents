@@ -30,6 +30,8 @@ type AgentSystemContentBlock =
   | AgentSystemTextBlock
   | { cachePoint: { type: 'default' } };
 
+type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -177,6 +179,8 @@ export class AgentContext {
   tokenCounter?: t.TokenCounter;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
+  /** Token count for instruction text emitted outside the system message. */
+  dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
@@ -190,7 +194,12 @@ export class AgentContext {
   get instructionTokens(): number {
     const summaryOverhead =
       this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
-    return this.systemMessageTokens + this.toolSchemaTokens + summaryOverhead;
+    return (
+      this.systemMessageTokens +
+      this.dynamicInstructionTokens +
+      this.toolSchemaTokens +
+      summaryOverhead
+    );
   }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
@@ -570,20 +579,29 @@ export class AgentContext {
 
     if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
+      this.dynamicInstructionTokens = 0;
       return undefined;
     }
 
-    const usePromptCache = this.hasAnthropicPromptCache();
+    const promptCacheProvider = this.getPromptCacheProvider();
+    const shouldMoveOpenRouterDynamicInstructions =
+      promptCacheProvider === Providers.OPENROUTER &&
+      stableInstructions !== '' &&
+      dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
       dynamicInstructions,
-      usePromptCache,
+      promptCacheProvider,
     });
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
         ? this.tokenCounter(systemMessage)
         : 0;
+      this.dynamicInstructionTokens =
+        shouldMoveOpenRouterDynamicInstructions
+          ? this.tokenCounter(new HumanMessage(dynamicInstructions))
+          : 0;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
@@ -597,45 +615,114 @@ export class AgentContext {
         this.summaryText != null &&
         this.summaryText !== '';
 
-      let body: BaseMessage[];
-      if (hasSummaryBody) {
-        const wrappedSummary =
-          '<summary>\n' +
-          (this.summaryText as string) +
-          '\n</summary>\n\n' +
-          'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+      const bodyWithSummary =
+        hasSummaryBody && promptCacheProvider !== Providers.OPENROUTER
+          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+          : messages;
+      const dynamicTail = this.buildOpenRouterDynamicTail({
+        dynamicInstructions,
+        hasSummaryBody,
+        promptCacheProvider,
+        shouldMoveOpenRouterDynamicInstructions,
+      });
+      let body = this.insertAfterFirstMessage(bodyWithSummary, dynamicTail);
 
-        const summaryMsg = usePromptCache
-          ? new HumanMessage({
-            content: [
-              {
-                type: 'text',
-                text: wrappedSummary,
-                cache_control: { type: 'ephemeral' },
-              },
-            ],
-          })
-          : new HumanMessage(wrappedSummary);
-        body = [summaryMsg, ...messages];
-      } else {
-        body = messages;
-      }
-
-      if (usePromptCache && body.length >= 2) {
+      if (
+        promptCacheProvider != null &&
+        dynamicTail.length === 0 &&
+        body.length >= 2
+      ) {
         body = addCacheControl(body);
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
   }
 
-  private hasAnthropicPromptCache(): boolean {
-    if (this.provider !== Providers.ANTHROPIC) {
-      return false;
+  private buildSummaryHumanMessage(
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): HumanMessage {
+    const wrappedSummary =
+      '<summary>\n' +
+      (this.summaryText as string) +
+      '\n</summary>\n\n' +
+      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+
+    if (promptCacheProvider !== Providers.ANTHROPIC) {
+      return new HumanMessage(wrappedSummary);
     }
-    const anthropicOptions = this.clientOptions as
-      | t.AnthropicClientOptions
-      | undefined;
-    return anthropicOptions?.promptCache === true;
+
+    return new HumanMessage({
+      content: [
+        {
+          type: 'text',
+          text: wrappedSummary,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+  }
+
+  private buildOpenRouterDynamicTail({
+    dynamicInstructions,
+    hasSummaryBody,
+    promptCacheProvider,
+    shouldMoveOpenRouterDynamicInstructions,
+  }: {
+    dynamicInstructions: string;
+    hasSummaryBody: boolean;
+    promptCacheProvider: PromptCacheProvider | undefined;
+    shouldMoveOpenRouterDynamicInstructions: boolean;
+  }): BaseMessage[] {
+    if (promptCacheProvider !== Providers.OPENROUTER) {
+      return [];
+    }
+
+    const dynamicTail = shouldMoveOpenRouterDynamicInstructions
+      ? [new HumanMessage(dynamicInstructions)]
+      : [];
+
+    if (!hasSummaryBody) {
+      return dynamicTail;
+    }
+
+    return [...dynamicTail, this.buildSummaryHumanMessage(promptCacheProvider)];
+  }
+
+  private insertAfterFirstMessage(
+    messages: BaseMessage[],
+    tail: BaseMessage[]
+  ): BaseMessage[] {
+    if (tail.length === 0) {
+      return messages;
+    }
+
+    if (messages.length === 0) {
+      return tail;
+    }
+
+    return [messages[0], ...tail, ...messages.slice(1)];
+  }
+
+  private getPromptCacheProvider(): PromptCacheProvider | undefined {
+    if (this.provider === Providers.ANTHROPIC) {
+      const anthropicOptions = this.clientOptions as
+        | t.AnthropicClientOptions
+        | undefined;
+      return anthropicOptions?.promptCache === true
+        ? Providers.ANTHROPIC
+        : undefined;
+    }
+
+    if (this.provider === Providers.OPENROUTER) {
+      const openRouterOptions = this.clientOptions as
+        | t.ProviderOptionsMap[Providers.OPENROUTER]
+        | undefined;
+      return openRouterOptions?.promptCache === true
+        ? Providers.OPENROUTER
+        : undefined;
+    }
+
+    return undefined;
   }
 
   private hasBedrockPromptCache(): boolean {
@@ -651,17 +738,17 @@ export class AgentContext {
   private buildSystemMessage({
     stableInstructions,
     dynamicInstructions,
-    usePromptCache,
+    promptCacheProvider,
   }: {
     stableInstructions: string;
     dynamicInstructions: string;
-    usePromptCache: boolean;
+    promptCacheProvider: PromptCacheProvider | undefined;
   }): SystemMessage | undefined {
     if (!stableInstructions && !dynamicInstructions) {
       return undefined;
     }
 
-    if (usePromptCache) {
+    if (promptCacheProvider === Providers.ANTHROPIC) {
       const content: AgentSystemContentBlock[] = [];
       if (stableInstructions) {
         content.push({
@@ -674,6 +761,25 @@ export class AgentContext {
         content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    if (
+      promptCacheProvider === Providers.OPENROUTER &&
+      !stableInstructions
+    ) {
+      return new SystemMessage(dynamicInstructions);
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER) {
+      return new SystemMessage({
+        content: [
+          {
+            type: 'text',
+            text: stableInstructions,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      } as BaseMessageFields);
     }
 
     if (this.hasBedrockPromptCache() && stableInstructions) {
@@ -699,6 +805,7 @@ export class AgentContext {
    */
   reset(): void {
     this.systemMessageTokens = 0;
+    this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
@@ -1054,6 +1161,7 @@ export class AgentContext {
       maxContextTokens,
       instructionTokens: this.instructionTokens,
       systemMessageTokens: this.systemMessageTokens,
+      dynamicInstructionTokens: this.dynamicInstructionTokens,
       toolSchemaTokens: this.toolSchemaTokens,
       summaryTokens: this.summaryTokenCount,
       toolCount,
@@ -1072,7 +1180,7 @@ export class AgentContext {
     const lines = [
       'Token budget breakdown:',
       `  maxContextTokens:    ${b.maxContextTokens}`,
-      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, dynamic: ${b.dynamicInstructionTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
       `  summaryTokens:       ${b.summaryTokens}`,
       `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
       `  availableForMessages: ${b.availableForMessages}`,

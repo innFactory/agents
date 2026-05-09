@@ -14,8 +14,13 @@ import {
   addBedrockCacheControl,
   addCacheControl,
 } from './cache';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
+
+type CacheControlBlock = MessageContentComplex & {
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+};
 
 describe('addCacheControl', () => {
   test('should add cache control to the last two user messages with array content', () => {
@@ -1481,5 +1486,127 @@ describe('LangChain message type preservation', () => {
     // Verify tool_calls are preserved
     expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
     expect((result[1] as AIMessage).tool_calls![0].name).toBe('navigate');
+  });
+});
+
+describe('OpenRouter prompt caching (reuses addCacheControl)', () => {
+  it('adds cache_control to LangChain messages for OpenRouter (same format as Anthropic)', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: [{ type: 'text', text: 'System context' }] }),
+      new AIMessage({ content: [{ type: 'text', text: 'Acknowledged' }] }),
+      new HumanMessage({ content: [{ type: 'text', text: 'User query' }] }),
+    ];
+
+    const result = addCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const lastContent = result[2].content as MessageContentComplex[];
+
+    expect((firstContent[0] as CacheControlBlock).cache_control).toEqual({
+      type: 'ephemeral',
+    });
+    expect((lastContent[0] as CacheControlBlock).cache_control).toEqual({
+      type: 'ephemeral',
+    });
+  });
+
+  it('preserves cache_control through OpenAI message conversion used by OpenRouter', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Hello',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+      new AIMessage({ content: 'Hi there' }),
+      new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Follow-up',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+    ];
+
+    const converted = _convertMessagesToOpenAIParams(messages);
+
+    const firstUserContent = converted[0].content as CacheControlBlock[];
+    const lastUserContent = converted[2].content as CacheControlBlock[];
+
+    expect(firstUserContent[0]).toHaveProperty('cache_control');
+    expect(firstUserContent[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(lastUserContent[0]).toHaveProperty('cache_control');
+    expect(lastUserContent[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('end-to-end: addCacheControl then convert preserves breakpoints for OpenRouter', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: 'First message with context' }),
+      new AIMessage({ content: 'Response' }),
+      new HumanMessage({ content: 'Second question' }),
+    ];
+
+    const cached = addCacheControl(messages);
+    const converted = _convertMessagesToOpenAIParams(
+      cached,
+      'anthropic/claude-sonnet-4-20250514'
+    );
+
+    const firstUser = converted[0];
+    const lastUser = converted[2];
+
+    expect(Array.isArray(firstUser.content)).toBe(true);
+    expect(
+      (firstUser.content as CacheControlBlock[])[0]
+    ).toHaveProperty('cache_control');
+
+    expect(Array.isArray(lastUser.content)).toBe(true);
+    expect(
+      (lastUser.content as CacheControlBlock[])[0]
+    ).toHaveProperty('cache_control');
+  });
+
+  it('strips Bedrock cache before applying OpenRouter/Anthropic cache', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'First message' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Response' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Follow-up' }],
+      },
+    ];
+
+    /** @ts-expect-error - Testing cross-provider compatibility */
+    const result = addCacheControl(messages);
+
+    for (const msg of result) {
+      if (Array.isArray(msg.content)) {
+        expect(
+          (msg.content as MessageContentComplex[]).some(
+            (b) => 'cachePoint' in b
+          )
+        ).toBe(false);
+      }
+    }
+
+    const lastContent = result[2].content as MessageContentComplex[];
+    expect('cache_control' in lastContent[0]).toBe(true);
   });
 });

@@ -134,6 +134,11 @@ type OpenAIChatCompletionRequest =
 type OpenAIChatCompletionResult =
   | AsyncIterable<OpenAIChatCompletionChunk>
   | OpenAIChatCompletion;
+type PromptTokensDetailsWithCacheWrite = NonNullable<
+  OpenAIClient.Completions.CompletionUsage['prompt_tokens_details']
+> & {
+  cache_write_tokens?: number;
+};
 type OpenAIChatCompletionRetry = (
   request: OpenAIChatCompletionRequest,
   requestOptions?: OpenAICoreRequestOptions
@@ -158,8 +163,12 @@ function createUsageMetadata(
   const outputTokenDetails: UsageMetadata['output_token_details'] = {};
   let hasInputTokenDetails = false;
   let hasOutputTokenDetails = false;
-  const audioInputTokens = usage.prompt_tokens_details?.audio_tokens;
-  const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
+  const promptTokenDetails = usage.prompt_tokens_details as
+    | PromptTokensDetailsWithCacheWrite
+    | undefined;
+  const audioInputTokens = promptTokenDetails?.audio_tokens;
+  const cachedInputTokens = promptTokenDetails?.cached_tokens;
+  const cacheWriteInputTokens = promptTokenDetails?.cache_write_tokens;
   const audioOutputTokens = usage.completion_tokens_details?.audio_tokens;
   const reasoningOutputTokens =
     usage.completion_tokens_details?.reasoning_tokens;
@@ -170,6 +179,10 @@ function createUsageMetadata(
   }
   if (cachedInputTokens != null) {
     inputTokenDetails.cache_read = cachedInputTokens;
+    hasInputTokenDetails = true;
+  }
+  if (cacheWriteInputTokens != null) {
+    inputTokenDetails.cache_creation = cacheWriteInputTokens;
     hasInputTokenDetails = true;
   }
   if (audioOutputTokens != null) {
@@ -685,16 +698,23 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       usageMetadata.total_tokens =
         (usageMetadata.total_tokens ?? 0) + totalTokens;
     }
+    const promptTokensDetailsWithCacheWrite = promptTokensDetails as
+      | PromptTokensDetailsWithCacheWrite
+      | undefined;
     if (
-      promptTokensDetails?.audio_tokens != null ||
-      promptTokensDetails?.cached_tokens != null
+      promptTokensDetailsWithCacheWrite?.audio_tokens != null ||
+      promptTokensDetailsWithCacheWrite?.cached_tokens != null ||
+      promptTokensDetailsWithCacheWrite?.cache_write_tokens != null
     ) {
       usageMetadata.input_token_details = {
-        ...(promptTokensDetails.audio_tokens != null && {
-          audio: promptTokensDetails.audio_tokens,
+        ...(promptTokensDetailsWithCacheWrite.audio_tokens != null && {
+          audio: promptTokensDetailsWithCacheWrite.audio_tokens,
         }),
-        ...(promptTokensDetails.cached_tokens != null && {
-          cache_read: promptTokensDetails.cached_tokens,
+        ...(promptTokensDetailsWithCacheWrite.cached_tokens != null && {
+          cache_read: promptTokensDetailsWithCacheWrite.cached_tokens,
+        }),
+        ...(promptTokensDetailsWithCacheWrite.cache_write_tokens != null && {
+          cache_creation: promptTokensDetailsWithCacheWrite.cache_write_tokens,
         }),
       };
     }
@@ -846,12 +866,18 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       );
     }
     if (usage) {
+      const promptTokenDetails = usage.prompt_tokens_details as
+        | PromptTokensDetailsWithCacheWrite
+        | undefined;
       const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
+        ...(promptTokenDetails?.audio_tokens != null && {
+          audio: promptTokenDetails.audio_tokens,
         }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
+        ...(promptTokenDetails?.cached_tokens != null && {
+          cache_read: promptTokenDetails.cached_tokens,
+        }),
+        ...(promptTokenDetails?.cache_write_tokens != null && {
+          cache_creation: promptTokenDetails.cache_write_tokens,
         }),
       };
       const outputTokenDetails = {

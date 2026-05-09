@@ -198,6 +198,151 @@ describe('AgentContext', () => {
       );
     });
 
+    it('marks stable OpenRouter system text and keeps first user message stable', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new HumanMessage('Second'),
+      ]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Stable instructions',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(result[1].content).toBe('Hello');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('keeps dynamic-only OpenRouter instructions as system text', async () => {
+      const tokenCounter = (msg: { content: unknown }): number => {
+        const content =
+          typeof msg.content === 'string'
+            ? msg.content
+            : JSON.stringify(msg.content);
+        return content.length;
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+        tokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const firstContent = result[1].content as TestSystemContentBlock[];
+      const secondContent = result[2].content as TestSystemContentBlock[];
+
+      expect(result).toHaveLength(3);
+      expect(result[0].content).toBe('Dynamic only');
+      expect(firstContent[0]).toMatchObject({
+        type: 'text',
+        text: 'First',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(secondContent[0]).toMatchObject({
+        type: 'text',
+        text: 'Second',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+    });
+
+    it('does not cache OpenRouter body messages after dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-2.5-flash',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const firstContent = result[1].content as TestSystemContentBlock[];
+      const secondContent = result[2].content as TestSystemContentBlock[];
+      expect(firstContent[0]).toHaveProperty('cache_control');
+      expect(secondContent[0]).toHaveProperty('cache_control');
+    });
+
+    it('places OpenRouter user-message summaries after the first stable message', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Rotating summary', 7);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toContain('Rotating summary');
+      expect(result[3].content).toBe('Second');
+    });
+
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
       const ctx = createBasicContext({
         agentConfig: {
@@ -555,6 +700,59 @@ describe('AgentContext', () => {
       await ctxWithDeferred.tokenCalculationPromise;
 
       expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('counts OpenRouter dynamic instructions outside the system message', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable',
+          additional_instructions: 'Dynamic tail',
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+      expect(ctx.instructionTokens).toBe(
+        ctx.systemMessageTokens + ctx.dynamicInstructionTokens
+      );
+      expect(ctx.getTokenBudgetBreakdown().dynamicInstructionTokens).toBe(
+        ctx.dynamicInstructionTokens
+      );
+    });
+
+    it('clears OpenRouter dynamic instruction tokens when no prompt remains', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.setInitialSummary('Volatile summary', 8);
+      ctx.initializeSystemRunnable();
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+
+      ctx.instructions = undefined;
+      ctx.clearSummary();
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemRunnable).toBeUndefined();
+      expect(ctx.systemMessageTokens).toBe(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(0);
     });
 
     it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
