@@ -70,6 +70,34 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+export async function resolveCodeApiAuthHeaders(
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeApiAuthHeaderMap> {
+  if (authHeaders == null) {
+    return {};
+  }
+  if (typeof authHeaders === 'function') {
+    return authHeaders();
+  }
+  return authHeaders;
+}
+
+export async function buildCodeApiHttpErrorMessage(
+  method: string,
+  endpoint: string,
+  response: { status: number; text: () => Promise<string> }
+): Promise<string> {
+  let responseBody = '';
+  try {
+    responseBody = await response.text();
+  } catch {
+    responseBody = '';
+  }
+  const body = responseBody.trim();
+  const bodySuffix = body === '' ? '' : `, body: ${body.slice(0, 1000)}`;
+  return `CodeAPI request failed: ${method} ${endpoint} returned ${response.status}${bodySuffix}`;
+}
+
 export const CodeExecutionToolDescription = `
 Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
 
@@ -92,6 +120,7 @@ function createCodeExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
+      const { authHeaders, ...executionParams } = params ?? {};
       const { lang, code, ...rest } = rawInput as {
         lang: SupportedLanguage;
         code: string;
@@ -111,7 +140,7 @@ function createCodeExecutionTool(
         lang,
         code,
         ...rest,
-        ...params,
+        ...executionParams,
       };
 
       /* File injection: `_injected_files` from ToolNode (set when host
@@ -135,11 +164,14 @@ function createCodeExecutionTool(
       }
 
       try {
+        const resolvedAuthHeaders =
+          await resolveCodeApiAuthHeaders(authHeaders);
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
+            ...resolvedAuthHeaders,
           },
           body: JSON.stringify(postData),
         };
@@ -149,7 +181,9 @@ function createCodeExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+          );
         }
 
         const result: t.ExecuteResult = await response.json();

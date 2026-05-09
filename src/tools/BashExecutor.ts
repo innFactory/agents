@@ -3,7 +3,12 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import {
+  emptyOutputMessage,
+  buildCodeApiHttpErrorMessage,
+  getCodeBaseURL,
+  resolveCodeApiAuthHeaders,
+} from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -104,6 +109,7 @@ function createBashExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
+      const { authHeaders, ...executionParams } = params ?? {};
       const { command, ...rest } = rawInput as {
         command: string;
         args?: string[];
@@ -117,7 +123,7 @@ function createBashExecutionTool(
         lang: 'bash',
         code: command,
         ...rest,
-        ...params,
+        ...executionParams,
       };
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
@@ -137,11 +143,14 @@ function createBashExecutionTool(
       }
 
       try {
+        const resolvedAuthHeaders =
+          await resolveCodeApiAuthHeaders(authHeaders);
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
+            ...resolvedAuthHeaders,
           },
           body: JSON.stringify(postData),
         };
@@ -151,7 +160,9 @@ function createBashExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+          );
         }
 
         const result: t.ExecuteResult = await response.json();

@@ -5,7 +5,12 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import {
+  buildCodeApiHttpErrorMessage,
+  emptyOutputMessage,
+  getCodeBaseURL,
+  resolveCodeApiAuthHeaders,
+} from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -147,6 +152,113 @@ const PYTHON_KEYWORDS = new Set([
   'yield',
 ]);
 
+export type FetchSessionFilesScope =
+  | { kind: 'skill'; id: string; version: number }
+  | { kind: 'agent' | 'user'; id: string; version?: never };
+
+type CodeApiSessionFileWire = {
+  id?: unknown;
+  name?: unknown;
+  metadata?: unknown;
+  resource_id?: unknown;
+  storage_session_id?: unknown;
+};
+
+type CodeApiSessionFileMetadata = {
+  'original-filename'?: unknown;
+};
+
+function isFetchSessionFilesScope(
+  value: unknown
+): value is FetchSessionFilesScope {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const scope = value as { kind?: unknown; id?: unknown; version?: unknown };
+  if (
+    (scope.kind === 'agent' || scope.kind === 'user') &&
+    typeof scope.id === 'string'
+  ) {
+    return true;
+  }
+  return (
+    scope.kind === 'skill' &&
+    typeof scope.id === 'string' &&
+    typeof scope.version === 'number'
+  );
+}
+
+function isCodeApiAuthHeaders(
+  value: string | t.CodeApiAuthHeaders | undefined
+): value is t.CodeApiAuthHeaders {
+  return value != null && typeof value !== 'string';
+}
+
+function isCodeApiSessionFileWire(
+  value: unknown
+): value is CodeApiSessionFileWire {
+  return value != null && typeof value === 'object';
+}
+
+function isCodeApiSessionFileMetadata(
+  value: unknown
+): value is CodeApiSessionFileMetadata {
+  return value != null && typeof value === 'object';
+}
+
+function normalizeSessionFile(
+  file: CodeApiSessionFileWire,
+  sessionId: string,
+  scope?: FetchSessionFilesScope
+): t.CodeEnvFile {
+  const metadata = isCodeApiSessionFileMetadata(file.metadata)
+    ? file.metadata
+    : undefined;
+  const rawName = typeof file.name === 'string' ? file.name : '';
+  const nameParts = rawName.split('/');
+  const fallbackId = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+  const id =
+    typeof file.id === 'string' && file.id !== '' ? file.id : fallbackId;
+  const originalFilename = metadata?.['original-filename'];
+  const name =
+    typeof originalFilename === 'string' ? originalFilename : rawName;
+  const storage_session_id =
+    typeof file.storage_session_id === 'string'
+      ? file.storage_session_id
+      : sessionId;
+  const resource_id =
+    typeof file.resource_id === 'string' && file.resource_id !== ''
+      ? file.resource_id
+      : (scope?.id ?? id);
+
+  if (scope?.kind === 'skill') {
+    return {
+      storage_session_id,
+      kind: 'skill',
+      id,
+      resource_id,
+      name,
+      version: scope.version,
+    };
+  }
+  if (scope != null) {
+    return {
+      storage_session_id,
+      kind: scope.kind,
+      id,
+      resource_id,
+      name,
+    };
+  }
+  return {
+    storage_session_id,
+    kind: 'user',
+    id,
+    resource_id: id,
+    name,
+  };
+}
+
 /**
  * Normalizes a tool name to Python identifier format.
  * Must match the Code API's `normalizePythonFunctionName` exactly:
@@ -250,20 +362,62 @@ export function filterToolsByUsage(
  * Files are returned as CodeEnvFile references to be included in the request.
  * @param baseUrl - The base URL for the Code API
  * @param sessionId - The session ID to fetch files from
+ * @param scope - Resource scope used by CodeAPI to authorize the session
  * @param proxy - Optional HTTP proxy URL
  * @returns Array of CodeEnvFile references, or empty array if fetch fails
  */
 export async function fetchSessionFiles(
   baseUrl: string,
   sessionId: string,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
+  scope: FetchSessionFilesScope,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
+  scopeOrProxy?: FetchSessionFilesScope | string,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
+  scopedAuthHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]> {
   try {
-    const filesEndpoint = `${baseUrl}/files/${sessionId}?detail=full`;
+    const scope = isFetchSessionFilesScope(scopeOrProxy)
+      ? scopeOrProxy
+      : undefined;
+    let proxy: string | undefined;
+    let authHeaders: t.CodeApiAuthHeaders | undefined;
+    if (scope == null) {
+      proxy = typeof scopeOrProxy === 'string' ? scopeOrProxy : undefined;
+      authHeaders = isCodeApiAuthHeaders(proxyOrAuthHeaders)
+        ? proxyOrAuthHeaders
+        : undefined;
+    } else if (typeof proxyOrAuthHeaders === 'string') {
+      proxy = proxyOrAuthHeaders;
+      authHeaders = scopedAuthHeaders;
+    } else {
+      authHeaders = proxyOrAuthHeaders ?? scopedAuthHeaders;
+    }
+    const query = new URLSearchParams({ detail: 'full' });
+    if (scope != null) {
+      query.set('kind', scope.kind);
+      query.set('id', scope.id);
+      if (scope.kind === 'skill') {
+        query.set('version', String(scope.version));
+      }
+    }
+    const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
         'User-Agent': 'LibreChat/1.0',
+        ...resolvedAuthHeaders,
       },
     };
 
@@ -273,7 +427,9 @@ export async function fetchSessionFiles(
 
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
-      throw new Error(`Failed to fetch files for session: ${response.status}`);
+      throw new Error(
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+      );
     }
 
     const files = await response.json();
@@ -281,25 +437,9 @@ export async function fetchSessionFiles(
       return [];
     }
 
-    return files.map((file: Record<string, unknown>) => {
-      // Extract the ID from the file name (part after session ID prefix and before extension)
-      const nameParts = (file.name as string).split('/');
-      const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
-
-      return {
-        storage_session_id: sessionId,
-        /* `/files` fallback returns code-output files belonging to
-         * the user; tag them user-private. */
-        kind: 'user' as const,
-        id,
-        /* `resource_id` informational for `kind: 'user'` —
-         * codeapi derives sessionKey from auth context. */
-        resource_id: id,
-        name: (file.metadata as Record<string, unknown>)[
-          'original-filename'
-        ] as string,
-      };
-    });
+    return files
+      .filter(isCodeApiSessionFileWire)
+      .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -319,13 +459,16 @@ export async function fetchSessionFiles(
 export async function makeRequest(
   endpoint: string,
   body: Record<string, unknown>,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.ProgrammaticExecutionResponse> {
+  const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
   const fetchOptions: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'LibreChat/1.0',
+      ...resolvedAuthHeaders,
     },
     body: JSON.stringify(body),
   };
@@ -337,9 +480,8 @@ export async function makeRequest(
   const response = await fetch(endpoint, fetchOptions);
 
   if (!response.ok) {
-    const errorText = await response.text();
     throw new Error(
-      `HTTP error! status: ${response.status}, body: ${errorText}`
+      await buildCodeApiHttpErrorMessage('POST', endpoint, response)
     );
   }
 
@@ -486,7 +628,8 @@ export function unwrapToolResponse(
  */
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
-  toolMap: t.ToolMap
+  toolMap: t.ToolMap,
+  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -502,7 +645,7 @@ export async function executeTools(
 
     try {
       const result = await tool.invoke(call.input, {
-        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+        metadata: { [programmaticToolName]: true },
       });
 
       const isMCPTool = tool.mcp === true;
@@ -661,7 +804,8 @@ export function createProgrammaticToolCallingTool(
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
           },
-          proxy
+          proxy,
+          initParams.authHeaders
         );
 
         // ====================================================================
@@ -697,7 +841,8 @@ export function createProgrammaticToolCallingTool(
               continuation_token: response.continuation_token,
               tool_results: toolResults,
             },
-            proxy
+            proxy,
+            initParams.authHeaders
           );
         }
 

@@ -312,7 +312,8 @@ export function createBashProgrammaticToolCallingTool(
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
           },
-          proxy
+          proxy,
+          initParams.authHeaders
         );
 
         // ====================================================================
@@ -339,7 +340,8 @@ export function createBashProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            toolMap
+            toolMap,
+            Constants.BASH_PROGRAMMATIC_TOOL_CALLING
           );
 
           response = await makeRequest(
@@ -348,7 +350,8 @@ export function createBashProgrammaticToolCallingTool(
               continuation_token: response.continuation_token,
               tool_results: toolResults,
             },
-            proxy
+            proxy,
+            initParams.authHeaders
           );
         }
 
