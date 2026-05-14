@@ -70,6 +70,13 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
+function getHandlerDispatchedEventKey(
+  eventName: string,
+  stepId: string
+): string {
+  return `${eventName}:${stepId}`;
+}
+
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
@@ -99,15 +106,18 @@ export abstract class Graph<
   ): Promise<string>;
   abstract dispatchRunStepDelta(
     id: string,
-    delta: t.ToolCallDelta
+    delta: t.ToolCallDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract dispatchMessageDelta(
     id: string,
-    delta: t.MessageDelta
+    delta: t.MessageDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract dispatchReasoningDelta(
     stepId: string,
-    delta: t.ReasoningDelta
+    delta: t.ReasoningDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract createCallModel(
     agentId?: string,
@@ -125,11 +135,12 @@ export abstract class Graph<
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
   /**
-   * Step IDs that have been dispatched via handler registry directly
-   * (in dispatchRunStep).  Used by the custom event callback to skip
-   * duplicate dispatch through the LangGraph callback chain.
+   * Step IDs dispatched through the handler registry during this run.
+   * Event echo suppression is tracked separately so repeated deltas for
+   * the same step are scoped to the active custom event dispatch.
    */
   handlerDispatchedStepIds: Set<string> = new Set();
+  protected handlerDispatchedEventCounts: Map<string, number> = new Map();
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
@@ -188,6 +199,7 @@ export abstract class Graph<
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
     this.toolExecution = undefined;
+    this.handlerDispatchedEventCounts.clear();
     /**
      * ToolNodes compiled from this graph captured the registry
      * instance at construction time, so simply dropping the Graph's
@@ -216,6 +228,27 @@ export abstract class Graph<
     }
     this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  markHandlerDispatchedEvent(eventName: string, stepId: string): () => void {
+    const key = getHandlerDispatchedEventKey(eventName, stepId);
+    this.handlerDispatchedEventCounts.set(
+      key,
+      (this.handlerDispatchedEventCounts.get(key) ?? 0) + 1
+    );
+    return () => {
+      const count = this.handlerDispatchedEventCounts.get(key) ?? 0;
+      if (count <= 1) {
+        this.handlerDispatchedEventCounts.delete(key);
+        return;
+      }
+      this.handlerDispatchedEventCounts.set(key, count - 1);
+    };
+  }
+
+  hasHandlerDispatchedEvent(eventName: string, stepId: string): boolean {
+    const key = getHandlerDispatchedEventKey(eventName, stepId);
+    return (this.handlerDispatchedEventCounts.get(key) ?? 0) > 0;
   }
 
   /**
@@ -279,9 +312,7 @@ export abstract class Graph<
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
   }> = new Set();
-  public getOrCreateFileCheckpointer():
-    | t.LocalFileCheckpointer
-    | undefined {
+  public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
     // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
@@ -301,9 +332,7 @@ export abstract class Graph<
     // cleanup hooks fire). The bundle factory itself accepts a pre-
     // supplied checkpointer when present, so re-injecting this one
     // into every ToolNode is idempotent.
-    const bundle = createLocalCodingToolBundle(
-      this.toolExecution.local ?? {}
-    );
+    const bundle = createLocalCodingToolBundle(this.toolExecution.local ?? {});
     this._fileCheckpointer = bundle.checkpointer;
     return this._fileCheckpointer;
   }
@@ -384,6 +413,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
+    );
+    this.handlerDispatchedEventCounts = resetIfNotEmpty(
+      this.handlerDispatchedEventCounts,
+      new Map()
     );
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
@@ -1307,9 +1340,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
             const stepId = this.getStepIdByKey(stepKey);
             if (typeof content === 'string') {
-              await this.dispatchMessageDelta(stepId, {
-                content: [{ type: ContentTypes.TEXT, text: content }],
-              });
+              await this.dispatchMessageDelta(
+                stepId,
+                {
+                  content: [{ type: ContentTypes.TEXT, text: content }],
+                },
+                metadata
+              );
             } else if (
               Array.isArray(content) &&
               content.every(
@@ -1320,9 +1357,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   c.type.startsWith('text')
               )
             ) {
-              await this.dispatchMessageDelta(stepId, {
-                content: content as t.MessageDelta['content'],
-              });
+              await this.dispatchMessageDelta(
+                stepId,
+                {
+                  content: content as t.MessageDelta['content'],
+                },
+                metadata
+              );
             }
           }
         }
@@ -1360,9 +1401,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const stepId = this.getStepIdByKey(stepKey);
           const content = responseMessage.content;
           if (typeof content === 'string') {
-            await this.dispatchMessageDelta(stepId, {
-              content: [{ type: ContentTypes.TEXT, text: content }],
-            });
+            await this.dispatchMessageDelta(
+              stepId,
+              {
+                content: [{ type: ContentTypes.TEXT, text: content }],
+              },
+              metadata
+            );
           } else if (
             Array.isArray(content) &&
             content.every(
@@ -1373,9 +1418,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 c.type.startsWith('text')
             )
           ) {
-            await this.dispatchMessageDelta(stepId, {
-              content: content as t.MessageDelta['content'],
-            });
+            await this.dispatchMessageDelta(
+              stepId,
+              {
+                content: content as t.MessageDelta['content'],
+              },
+              metadata
+            );
           }
         }
       }
@@ -1613,12 +1662,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 this.handlerDispatchedStepIds.add(runStep.id);
               }
 
-              if (resolvedConfig) {
-                await safeDispatchCustomEvent(
+              const unmarkHandlerDispatchedEvent = handler
+                ? this.markHandlerDispatchedEvent(
                   GraphEvents.ON_RUN_STEP,
-                  runStep,
-                  resolvedConfig
-                );
+                  runStep.id
+                )
+                : undefined;
+              try {
+                if (resolvedConfig) {
+                  await safeDispatchCustomEvent(
+                    GraphEvents.ON_RUN_STEP,
+                    runStep,
+                    resolvedConfig
+                  );
+                }
+              } finally {
+                unmarkHandlerDispatchedEvent?.();
               }
             },
             dispatchRunStepCompleted: async (
@@ -1663,7 +1722,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!a.length) {
+          if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);
@@ -1782,11 +1841,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // but the primary dispatch above guarantees the event reaches the handler.
     // The customEventCallback in run.ts skips events already dispatched above
     // to prevent double handling.
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_RUN_STEP,
-      runStep,
-      this.config
-    );
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP, stepId)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP,
+        runStep,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
     return stepId;
   }
 
@@ -1858,7 +1924,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   async dispatchRunStepDelta(
     id: string,
-    delta: t.ToolCallDelta
+    delta: t.ToolCallDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
@@ -1869,14 +1936,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_RUN_STEP_DELTA,
-      runStepDelta,
-      this.config
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_RUN_STEP_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_RUN_STEP_DELTA,
+        runStepDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(id);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP_DELTA, id)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP_DELTA,
+        runStepDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   }
 
-  async dispatchMessageDelta(id: string, delta: t.MessageDelta): Promise<void> {
+  async dispatchMessageDelta(
+    id: string,
+    delta: t.MessageDelta,
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -1884,16 +1974,36 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_MESSAGE_DELTA,
-      messageDelta,
-      this.config
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_MESSAGE_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_MESSAGE_DELTA,
+        messageDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(id);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_MESSAGE_DELTA, id)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_MESSAGE_DELTA,
+        messageDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   }
 
   dispatchReasoningDelta = async (
     stepId: string,
-    delta: t.ReasoningDelta
+    delta: t.ReasoningDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void> => {
     if (!this.config) {
       throw new Error('No config provided');
@@ -1902,10 +2012,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id: stepId,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_REASONING_DELTA,
-      reasoningDelta,
-      this.config
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_REASONING_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_REASONING_DELTA,
+        reasoningDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(stepId);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_REASONING_DELTA, stepId)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_REASONING_DELTA,
+        reasoningDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   };
 }
